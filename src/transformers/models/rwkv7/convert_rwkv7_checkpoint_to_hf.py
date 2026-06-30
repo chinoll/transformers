@@ -14,8 +14,10 @@
 """Convert a RWKV7 checkpoint from BlinkDL to the Hugging Face format."""
 
 import argparse
+import ast
 import gc
 import inspect
+import json
 import os
 import re
 
@@ -25,6 +27,12 @@ from safetensors.torch import save_file
 
 from transformers import AutoModelForCausalLM, Rwkv7Config, Rwkv7Tokenizer
 from transformers.utils import SAFE_WEIGHTS_NAME
+
+
+CHAT_TEMPLATE = """{%- for message in messages -%}
+{%- set content = message['content'] | trim | replace('\\n\\n', '\\n') -%}
+{%- if message['role'] == 'system' -%}System: {{ content }}{%- elif message['role'] == 'user' -%}User: {{ content }}{%- elif message['role'] == 'assistant' -%}Assistant: {{ content }}{%- else -%}{{ raise_exception('Unsupported role: ' + message['role']) }}{%- endif -%}{%- if not loop.last -%}{{ '\\n\\n' }}{%- endif -%}
+{%- endfor -%}{%- if add_generation_prompt -%}{%- if messages|length > 0 -%}{{ '\\n\\n' }}{%- endif -%}Assistant:{%- endif -%}"""
 
 
 def load_checkpoint_state_dict(checkpoint_file, map_location="cpu"):
@@ -116,6 +124,7 @@ def infer_rwkv7_config(state_dict, checkpoint_file, context_length=None):
         group_norm_epsilon=64e-5,
         bos_token_id=0,
         eos_token_id=0,
+        pad_token_id=0,
         tie_word_embeddings=False,
     )
     config.architectures = ["Rwkv7ForCausalLM"]
@@ -191,6 +200,27 @@ def check_supported_rwkv7_state_dict(state_dict):
                 )
 
 
+def convert_rwkv_vocab_to_json(vocab_file, output_dir):
+    vocab = {}
+    with open(vocab_file, encoding="utf-8") as vocab_handle:
+        for line in vocab_handle:
+            idx = int(line[: line.index(" ")])
+            token = ast.literal_eval(line[line.index(" ") : line.rindex(" ")])
+            token = token.encode("utf-8") if isinstance(token, str) else token
+            if not isinstance(token, bytes):
+                raise ValueError(f"Invalid RWKV token at index {idx}: expected bytes or str, got {type(token)}")
+            if len(token) != int(line[line.rindex(" ") :]):
+                raise ValueError(f"Invalid RWKV token length at index {idx}.")
+            vocab[token.decode("latin-1")] = idx
+
+    output_vocab_file = os.path.join(output_dir, "vocab.json")
+    with open(output_vocab_file, "w", encoding="utf-8") as vocab_handle:
+        json.dump(vocab, vocab_handle, ensure_ascii=False, indent=2)
+        vocab_handle.write("\n")
+
+    return output_vocab_file
+
+
 def convert_rwkv7_checkpoint_to_hf_format(
     repo_id, checkpoint_file, output_dir, vocab_file, context_length=None, push_to_hub=False, model_name=None
 ):
@@ -204,7 +234,8 @@ def convert_rwkv7_checkpoint_to_hf_format(
     config = infer_rwkv7_config(state_dict, checkpoint_file, context_length=context_length)
     config.save_pretrained(output_dir)
 
-    tokenizer = Rwkv7Tokenizer(vocab_file, vocab_size=config.vocab_size)
+    vocab_file = convert_rwkv_vocab_to_json(vocab_file, output_dir)
+    tokenizer = Rwkv7Tokenizer(vocab_file, vocab_size=config.vocab_size, chat_template=CHAT_TEMPLATE)
     tokenizer.save_pretrained(output_dir)
 
     state_dict = convert_state_dict_rwkv7(state_dict)

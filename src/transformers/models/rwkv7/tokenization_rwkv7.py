@@ -13,9 +13,8 @@
 # limitations under the License.
 """Tokenization classes for RWKV7."""
 
-import ast
+import json
 import os
-import shutil
 
 from ...tokenization_utils import PreTrainedTokenizer
 from ...utils import logging
@@ -23,15 +22,17 @@ from ...utils import logging
 
 logger = logging.get_logger(__name__)
 
-VOCAB_FILES_NAMES = {"vocab_file": "rwkv_vocab_v20230424.txt"}
+MERGES_FILE = "merges.txt"
+TOKENIZER_FILE = "tokenizer.json"
+VOCAB_FILES_NAMES = {"vocab_file": "vocab.json"}
 
 
 class Rwkv7Tokenizer(PreTrainedTokenizer):
     """
-    RWKV byte-level tokenizer using the longest-token match vocabulary from `rwkv_vocab_v20230424.txt`.
+    RWKV byte-level tokenizer using the longest-token match vocabulary from `vocab.json`.
 
-    The vocabulary file stores explicit token ids and leaves a few ids unused. This tokenizer preserves those ids
-    instead of compacting the vocabulary.
+    The vocabulary stores explicit token ids and leaves a few ids unused. This tokenizer preserves those ids instead
+    of compacting the vocabulary.
     """
 
     vocab_files_names = VOCAB_FILES_NAMES
@@ -44,8 +45,11 @@ class Rwkv7Tokenizer(PreTrainedTokenizer):
         bos_token="<|endoftext|>",
         eos_token="<|endoftext|>",
         unk_token="<|endoftext|>",
+        pad_token="<|endoftext|>",
         **kwargs,
     ):
+        kwargs.pop("tokenizer_file", None)
+        kwargs.pop("merges_file", None)
         self.vocab_file = vocab_file
         self.idx2token, sorted_tokens = self._load_vocab(vocab_file)
         self.vocab_size_value = max(self.idx2token) + 1 if vocab_size is None else vocab_size
@@ -67,7 +71,7 @@ class Rwkv7Tokenizer(PreTrainedTokenizer):
         self.str2idx = {self._bytes_to_token(token): token_id for token, token_id in self.token2idx.items()}
         self.table, self.good, self.max_token_length = self._build_lookup_tables(sorted_tokens)
 
-        super().__init__(bos_token=bos_token, eos_token=eos_token, unk_token=unk_token, **kwargs)
+        super().__init__(bos_token=bos_token, eos_token=eos_token, unk_token=unk_token, pad_token=pad_token, **kwargs)
 
     @staticmethod
     def _bytes_to_token(token):
@@ -77,21 +81,26 @@ class Rwkv7Tokenizer(PreTrainedTokenizer):
     def _token_to_bytes(token):
         return token.encode("latin-1")
 
-    @staticmethod
-    def _load_vocab(vocab_file):
+    @classmethod
+    def _load_vocab(cls, vocab_file):
+        if not vocab_file.endswith(".json"):
+            raise ValueError("`Rwkv7Tokenizer` expects a `vocab.json` file.")
+        return cls._load_json_vocab(vocab_file)
+
+    @classmethod
+    def _load_json_vocab(cls, vocab_file):
+        with open(vocab_file, encoding="utf-8") as vocab_handle:
+            vocab = json.load(vocab_handle)
+
         idx2token = {}
         sorted_tokens = []
-        with open(vocab_file, encoding="utf-8") as vocab_handle:
-            for line in vocab_handle:
-                idx = int(line[: line.index(" ")])
-                token = ast.literal_eval(line[line.index(" ") : line.rindex(" ")])
-                token = token.encode("utf-8") if isinstance(token, str) else token
-                if not isinstance(token, bytes):
-                    raise ValueError(f"Invalid RWKV token at index {idx}: expected bytes or str, got {type(token)}")
-                if len(token) != int(line[line.rindex(" ") :]):
-                    raise ValueError(f"Invalid RWKV token length at index {idx}.")
+        for token, idx in vocab.items():
+            token = cls._token_to_bytes(token)
+            idx = int(idx)
+            idx2token[idx] = token
+            if idx == 0 or not token.startswith(b"<|rwkv_unused_"):
                 sorted_tokens.append(token)
-                idx2token[idx] = token
+
         return idx2token, sorted_tokens
 
     @staticmethod
@@ -174,13 +183,52 @@ class Rwkv7Tokenizer(PreTrainedTokenizer):
             logger.error("Vocabulary path (%s) should be a directory.", save_directory)
             return None
 
+        prefix = filename_prefix + "-" if filename_prefix else ""
         out_vocab_file = os.path.join(
             save_directory,
-            (filename_prefix + "-" if filename_prefix else "") + VOCAB_FILES_NAMES["vocab_file"],
+            prefix + VOCAB_FILES_NAMES["vocab_file"],
         )
-        if os.path.abspath(self.vocab_file) != os.path.abspath(out_vocab_file):
-            shutil.copyfile(self.vocab_file, out_vocab_file)
-        return (out_vocab_file,)
+        vocab = {
+            self._bytes_to_token(token): token_id
+            for token_id, token in sorted(self.idx2token.items(), key=lambda item: item[0])
+        }
+        with open(out_vocab_file, "w", encoding="utf-8") as vocab_handle:
+            json.dump(vocab, vocab_handle, ensure_ascii=False, indent=2)
+            vocab_handle.write("\n")
+
+        out_tokenizer_file = os.path.join(save_directory, prefix + TOKENIZER_FILE)
+        tokenizer_manifest = {
+            "version": "1.0",
+            "truncation": None,
+            "padding": None,
+            "added_tokens": self._serialize_added_tokens(),
+            "normalizer": None,
+            "pre_tokenizer": {"type": "RWKV7ByteLevel"},
+            "post_processor": None,
+            "decoder": {"type": "RWKV7ByteLevel"},
+            "model": {
+                "type": "RWKV7LongestMatch",
+                "vocab_file": VOCAB_FILES_NAMES["vocab_file"],
+                "vocab_size": self.vocab_size,
+            },
+        }
+        with open(out_tokenizer_file, "w", encoding="utf-8") as tokenizer_handle:
+            json.dump(tokenizer_manifest, tokenizer_handle, ensure_ascii=False, indent=2)
+            tokenizer_handle.write("\n")
+
+        out_merges_file = os.path.join(save_directory, prefix + MERGES_FILE)
+        with open(out_merges_file, "w", encoding="utf-8") as merges_handle:
+            merges_handle.write("# RWKV7 uses byte-level longest-match tokenization; no BPE merges are used.\n")
+
+        return (out_vocab_file, out_tokenizer_file, out_merges_file)
+
+    def _serialize_added_tokens(self):
+        added_tokens = []
+        for token_id, token in sorted(self.added_tokens_decoder.items()):
+            token_state = token.__getstate__()
+            token_state["id"] = token_id
+            added_tokens.append(token_state)
+        return added_tokens
 
 
 __all__ = ["Rwkv7Tokenizer"]

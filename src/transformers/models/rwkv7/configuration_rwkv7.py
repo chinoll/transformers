@@ -91,6 +91,7 @@ class Rwkv7Config(PreTrainedConfig):
     layer_norm_epsilon: float = 1e-5
     bos_token_id: int | None = 0
     eos_token_id: int | list[int] | None = 0
+    pad_token_id: int | None = 0
     tie_word_embeddings: bool = False
     use_cache: bool = True
 

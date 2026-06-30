@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
 import os
 import re
 import tempfile
@@ -37,6 +38,7 @@ if is_torch_available():
     from transformers import Rwkv7ForCausalLM, Rwkv7Model
     from transformers.models.rwkv7.convert_rwkv7_checkpoint_to_hf import (
         check_supported_rwkv7_state_dict,
+        convert_rwkv_vocab_to_json,
         convert_state_dict_rwkv7,
         infer_rwkv7_config,
     )
@@ -222,6 +224,7 @@ class Rwkv7ModelTest(unittest.TestCase):
         self.assertEqual(config.hidden_size, 16)
         self.assertEqual(config.num_hidden_layers, 2)
         self.assertEqual(config.context_length, 8192)
+        self.assertEqual(config.pad_token_id, 0)
         self.assertEqual(config.head_size, 4)
         self.assertEqual(config.decay_lora_rank, 6)
         self.assertEqual(config.in_context_learning_lora_rank, 5)
@@ -319,8 +322,46 @@ class Rwkv7ModelTest(unittest.TestCase):
 
     def test_tokenizer(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
-            vocab_file = os.path.join(tmp_dir, "rwkv_vocab_v20230424.txt")
+            vocab_file = os.path.join(tmp_dir, "vocab.json")
             with open(vocab_file, "w", encoding="utf-8") as vocab_handle:
+                json.dump({"H": 1, "e": 2, "l": 3, "o": 4, " ": 5, "Hello": 6}, vocab_handle)
+
+            chat_template = "{% for message in messages %}{{ message['role'] }}: {{ message['content'] }}{% endfor %}"
+            tokenizer = Rwkv7Tokenizer(vocab_file, vocab_size=16, chat_template=chat_template)
+            self.assertEqual(len(tokenizer), 16)
+            self.assertEqual(tokenizer.pad_token, "<|endoftext|>")
+            expected_input_ids = [6, 5]
+            self.assertEqual(tokenizer.encode("Hello ", add_special_tokens=False), expected_input_ids)
+            self.assertEqual(tokenizer.decode(expected_input_ids), "Hello ")
+            expected_chat = tokenizer.apply_chat_template(
+                [{"role": "user", "content": "Hello"}], tokenize=False, add_generation_prompt=False
+            )
+
+            tokenizer.save_pretrained(tmp_dir)
+            self.assertTrue(os.path.exists(os.path.join(tmp_dir, "vocab.json")))
+            self.assertTrue(os.path.exists(os.path.join(tmp_dir, "tokenizer.json")))
+            self.assertTrue(os.path.exists(os.path.join(tmp_dir, "tokenizer_config.json")))
+            self.assertTrue(os.path.exists(os.path.join(tmp_dir, "merges.txt")))
+            self.assertTrue(os.path.exists(os.path.join(tmp_dir, "chat_template.jinja")))
+            with open(os.path.join(tmp_dir, "tokenizer.json"), encoding="utf-8") as tokenizer_handle:
+                self.assertIn("added_tokens", json.load(tokenizer_handle))
+            tokenizer = AutoTokenizer.from_pretrained(tmp_dir)
+            self.assertIsInstance(tokenizer, Rwkv7Tokenizer)
+            self.assertEqual(tokenizer.pad_token, "<|endoftext|>")
+            self.assertEqual(tokenizer.encode("Hello ", add_special_tokens=False), expected_input_ids)
+            self.assertEqual(tokenizer.decode(expected_input_ids), "Hello ")
+            actual_chat = tokenizer.apply_chat_template(
+                [{"role": "user", "content": "Hello"}], tokenize=False, add_generation_prompt=False
+            )
+            self.assertEqual(actual_chat, expected_chat)
+
+            with self.assertRaises(ValueError):
+                Rwkv7Tokenizer(os.path.join(tmp_dir, "rwkv_vocab_v20230424.txt"), vocab_size=16)
+
+    def test_convert_rwkv_vocab_to_json(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            rwkv_vocab_file = os.path.join(tmp_dir, "rwkv_vocab_v20230424.txt")
+            with open(rwkv_vocab_file, "w", encoding="utf-8") as vocab_handle:
                 vocab_handle.write("1 'H' 1\n")
                 vocab_handle.write("2 'e' 1\n")
                 vocab_handle.write("3 'l' 1\n")
@@ -328,14 +369,13 @@ class Rwkv7ModelTest(unittest.TestCase):
                 vocab_handle.write("5 ' ' 1\n")
                 vocab_handle.write("6 'Hello' 5\n")
 
-            tokenizer = Rwkv7Tokenizer(vocab_file, vocab_size=16)
-            self.assertEqual(len(tokenizer), 16)
-            self.assertEqual(tokenizer.encode("Hello ", add_special_tokens=False), [6, 5])
-            self.assertEqual(tokenizer.decode([6, 5]), "Hello ")
+            vocab_file = convert_rwkv_vocab_to_json(rwkv_vocab_file, tmp_dir)
+            self.assertEqual(os.path.basename(vocab_file), "vocab.json")
+            with open(vocab_file, encoding="utf-8") as vocab_handle:
+                vocab = json.load(vocab_handle)
 
-            tokenizer.save_pretrained(tmp_dir)
-            tokenizer = AutoTokenizer.from_pretrained(tmp_dir)
-            self.assertIsInstance(tokenizer, Rwkv7Tokenizer)
+            self.assertEqual(vocab["Hello"], 6)
+            tokenizer = Rwkv7Tokenizer(vocab_file, vocab_size=16)
             self.assertEqual(tokenizer.encode("Hello ", add_special_tokens=False), [6, 5])
 
     def reference_rwkv7_linear_attention(
