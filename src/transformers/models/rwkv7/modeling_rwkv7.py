@@ -13,6 +13,7 @@
 # limitations under the License.
 """PyTorch RWKV7 model."""
 
+import importlib
 from dataclasses import dataclass
 
 import torch
@@ -30,7 +31,53 @@ from .configuration_rwkv7 import Rwkv7Config
 logger = logging.get_logger(__name__)
 
 
-def rwkv7_linear_attention(
+_RWKV7_KERNEL = None
+_RWKV7_KERNEL_LOAD_ATTEMPTED = False
+_RWKV7_KERNEL_LOAD_ERROR = None
+
+
+def _load_rwkv7_kernel():
+    global _RWKV7_KERNEL, _RWKV7_KERNEL_LOAD_ATTEMPTED, _RWKV7_KERNEL_LOAD_ERROR
+
+    if _RWKV7_KERNEL_LOAD_ATTEMPTED:
+        return _RWKV7_KERNEL
+
+    _RWKV7_KERNEL_LOAD_ATTEMPTED = True
+
+    try:
+        from ...integrations.hub_kernels import get_kernel
+
+        _RWKV7_KERNEL = get_kernel("kernels-community/rwkv7", version=1)
+        return _RWKV7_KERNEL
+    except Exception as hub_error:
+        _RWKV7_KERNEL_LOAD_ERROR = hub_error
+
+    try:
+        _RWKV7_KERNEL = importlib.import_module("rwkv7")
+    except Exception as import_error:
+        _RWKV7_KERNEL_LOAD_ERROR = import_error
+        _RWKV7_KERNEL = None
+
+    return _RWKV7_KERNEL
+
+
+def _can_use_rwkv7_kernel(raw_decay, receptance, key, value, in_context_state, in_context_rate):
+    if raw_decay is None:
+        return False
+    if raw_decay.dtype != torch.bfloat16:
+        return False
+    if key.device.type != "cuda":
+        return False
+    if key.size(-1) != 64:
+        return False
+    if key.size(1) < 16:
+        return False
+
+    kernel_inputs = (receptance, key, value, in_context_state, in_context_rate)
+    return all(tensor.dtype == torch.bfloat16 for tensor in kernel_inputs)
+
+
+def _rwkv7_linear_attention_naive(
     decay, receptance, key, value, in_context_state, in_context_rate, state=None, return_state=False
 ):
     batch_size, seq_length, num_heads, head_size = key.shape
@@ -87,6 +134,103 @@ def rwkv7_linear_attention(
         state = None
 
     return output, state
+
+
+def rwkv7_linear_attention(
+    decay,
+    receptance,
+    key,
+    value,
+    in_context_state,
+    in_context_rate,
+    state=None,
+    return_state=False,
+    raw_decay=None,
+):
+    if not _can_use_rwkv7_kernel(raw_decay, receptance, key, value, in_context_state, in_context_rate):
+        return _rwkv7_linear_attention_naive(
+            decay,
+            receptance,
+            key,
+            value,
+            in_context_state,
+            in_context_rate,
+            state=state,
+            return_state=return_state,
+        )
+
+    kernel = _load_rwkv7_kernel()
+    if kernel is None:
+        logger.warning_once(
+            "RWKV7 CUDA kernel is not available, using the plain Python implementation for token mixing. "
+            "This may be very slow for long sequences. Install the `kernels` package and "
+            "`kernels-community/rwkv7`, or install a compatible local `rwkv7` kernel package."
+        )
+        return _rwkv7_linear_attention_naive(
+            decay,
+            receptance,
+            key,
+            value,
+            in_context_state,
+            in_context_rate,
+            state=state,
+            return_state=return_state,
+        )
+
+    batch_size, seq_length, num_heads, head_size = key.shape
+    has_initial_state = state is not None
+    chunk_length = (seq_length // 16) * 16
+
+    if state is None and not return_state and chunk_length == seq_length and hasattr(kernel, "sequence"):
+        rwkv = kernel.sequence(
+            receptance.contiguous(),
+            raw_decay.to(dtype=torch.bfloat16).contiguous(),
+            key.contiguous(),
+            value.contiguous(),
+            in_context_state.contiguous(),
+            in_context_rate.contiguous(),
+        )
+        return rwkv, None
+
+    if state is None:
+        state = torch.zeros(
+            batch_size,
+            num_heads,
+            head_size,
+            head_size,
+            dtype=torch.float32,
+            device=value.device,
+        )
+    else:
+        state = state.float()
+
+    rwkv, state = kernel.state_passing(
+        state,
+        receptance[:, :chunk_length].contiguous(),
+        raw_decay[:, :chunk_length].to(dtype=torch.bfloat16).contiguous(),
+        key[:, :chunk_length].contiguous(),
+        value[:, :chunk_length].contiguous(),
+        in_context_state[:, :chunk_length].contiguous(),
+        in_context_rate[:, :chunk_length].contiguous(),
+    )
+
+    if chunk_length < seq_length:
+        tail_rwkv, state = _rwkv7_linear_attention_naive(
+            decay[:, chunk_length:],
+            receptance[:, chunk_length:],
+            key[:, chunk_length:],
+            value[:, chunk_length:],
+            in_context_state[:, chunk_length:],
+            in_context_rate[:, chunk_length:],
+            state=state,
+            return_state=True,
+        )
+        rwkv = torch.cat([rwkv, tail_rwkv], dim=1)
+
+    if not (return_state or has_initial_state):
+        state = None
+
+    return rwkv, state
 
 
 class Rwkv7SelfAttention(nn.Module):
@@ -158,7 +302,8 @@ class Rwkv7SelfAttention(nn.Module):
         gate_hidden = hidden + time_shift * self.x_g
 
         receptance = self.receptance(receptance_hidden)
-        raw_decay = self.w0.float() + (torch.tanh(decay_hidden @ self.w1) @ self.w2).float()
+        raw_decay_for_kernel = self.w0 + torch.tanh(decay_hidden @ self.w1) @ self.w2
+        raw_decay = raw_decay_for_kernel.float()
         decay = torch.exp(-0.606531 * torch.sigmoid(raw_decay))
 
         key = self.key(key_hidden)
@@ -180,6 +325,7 @@ class Rwkv7SelfAttention(nn.Module):
         receptance = receptance.view(batch_size, seq_length, self.num_heads, self.head_size)
         key = key.view(batch_size, seq_length, self.num_heads, self.head_size)
         value = value.view(batch_size, seq_length, self.num_heads, self.head_size)
+        raw_decay_for_kernel = raw_decay_for_kernel.view(batch_size, seq_length, self.num_heads, self.head_size)
         decay = decay.view(batch_size, seq_length, self.num_heads, self.head_size)
         in_context_rate = in_context_rate.view(batch_size, seq_length, self.num_heads, self.head_size)
 
@@ -193,6 +339,7 @@ class Rwkv7SelfAttention(nn.Module):
             normalized_key * in_context_rate,
             state=layer_state,
             return_state=use_cache,
+            raw_decay=raw_decay_for_kernel,
         )
 
         if layer_state is not None:
@@ -515,9 +662,9 @@ class Rwkv7Model(Rwkv7PreTrainedModel):
         super().__init__(config)
 
         logger.warning_once(
-            "RWKV7 is currently using the plain Python implementation for token mixing. "
-            "This implementation is numerically aligned with the RWKV-LM reference, but it may be very slow, "
-            "especially for long sequences."
+            "RWKV7 uses the RWKV-CUDA fast-compatible kernel for supported BF16 CUDA full-sequence token mixing "
+            "when it is available. Unsupported calls fall back to the plain Python implementation, which may be "
+            "very slow for long sequences."
         )
 
         self.embeddings = nn.Embedding(config.vocab_size, config.hidden_size)
@@ -691,26 +838,6 @@ class Rwkv7Model(Rwkv7PreTrainedModel):
             raise ValueError("You cannot specify both input_ids and inputs_embeds at the same time")
         elif input_ids is None and inputs_embeds is None:
             raise ValueError("You have to specify either input_ids or inputs_embeds")
-
-        if not self.training and input_ids is not None and inputs_embeds is None and input_ids.size(0) > 1:
-            return self._forward_eval_batch_samplewise(
-                input_ids=input_ids,
-                state=state,
-                use_cache=use_cache,
-                output_attentions=output_attentions,
-                output_hidden_states=output_hidden_states,
-                return_dict=return_dict,
-            )
-
-        if not self.training and input_ids is not None and inputs_embeds is None and input_ids.size(1) > 1:
-            return self._forward_recurrent_eval(
-                input_ids=input_ids,
-                state=state,
-                use_cache=use_cache,
-                output_attentions=output_attentions,
-                output_hidden_states=output_hidden_states,
-                return_dict=return_dict,
-            )
 
         if inputs_embeds is None:
             inputs_embeds = self.embeddings(input_ids)

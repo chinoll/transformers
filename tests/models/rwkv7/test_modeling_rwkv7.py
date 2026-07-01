@@ -17,6 +17,7 @@ import os
 import re
 import tempfile
 import unittest
+from importlib.util import find_spec
 
 from transformers import (
     AutoConfig,
@@ -296,6 +297,137 @@ class Rwkv7ModelTest(unittest.TestCase):
 
         self.assertTrue(torch.allclose(actual, expected, atol=1e-6, rtol=1e-6))
         self.assertTrue(torch.allclose(actual_state, expected_state, atol=1e-6, rtol=1e-6))
+
+    @unittest.skipIf(not torch.cuda.is_available() or find_spec("rwkv7") is None, "RWKV7 CUDA kernel is unavailable")
+    def test_linear_attention_kernel_path_matches_rwkv_cuda_reference(self):
+        batch_size = 2
+        seq_length = 33
+        num_heads = 2
+        head_size = 64
+        generator = torch.Generator(device="cuda").manual_seed(0)
+        raw_decay = torch.randn(
+            batch_size, seq_length, num_heads, head_size, generator=generator, device="cuda", dtype=torch.bfloat16
+        )
+        # RWKV-CUDA `rwkv7_statepassing_clampw` takes the unclamped BF16 `w` and computes
+        # exp(-exp(-0.5) * sigmoid(w)) inside the kernel. RWKV-LM's fast demo pre-clamps
+        # `w` with `-softplus(-w) - 0.5` and then applies exp(-exp(w)); the formulas are
+        # equivalent before reduced-precision rounding.
+        rwkv_cuda_decay = torch.exp(-0.6065306597 * torch.sigmoid(raw_decay.float()))
+        fast_log_decay = (-torch.nn.functional.softplus(-raw_decay.float()) - 0.5).to(raw_decay.dtype)
+        rwkv_lm_fast_decay = torch.exp(-torch.exp(fast_log_decay.float()))
+        receptance = (
+            torch.randn(
+                batch_size, seq_length, num_heads, head_size, generator=generator, device="cuda", dtype=torch.bfloat16
+            )
+            * 0.05
+        )
+        key = (
+            torch.randn(
+                batch_size, seq_length, num_heads, head_size, generator=generator, device="cuda", dtype=torch.bfloat16
+            )
+            * 0.05
+        )
+        value = (
+            torch.randn(
+                batch_size, seq_length, num_heads, head_size, generator=generator, device="cuda", dtype=torch.bfloat16
+            )
+            * 0.05
+        )
+        in_context_state = (
+            torch.randn(
+                batch_size, seq_length, num_heads, head_size, generator=generator, device="cuda", dtype=torch.bfloat16
+            )
+            * 0.05
+        )
+        in_context_rate = (
+            torch.randn(
+                batch_size, seq_length, num_heads, head_size, generator=generator, device="cuda", dtype=torch.bfloat16
+            )
+            * 0.05
+        )
+        state = torch.randn(batch_size, num_heads, head_size, head_size, generator=generator, device="cuda") * 0.01
+
+        expected, expected_state = self.reference_rwkv7_linear_attention(
+            rwkv_cuda_decay, receptance, key, value, in_context_state, in_context_rate, state=state
+        )
+        fast_expected, fast_expected_state = self.reference_rwkv7_linear_attention(
+            rwkv_lm_fast_decay, receptance, key, value, in_context_state, in_context_rate, state=state
+        )
+        actual, actual_state = rwkv7_linear_attention(
+            rwkv_cuda_decay,
+            receptance,
+            key,
+            value,
+            in_context_state,
+            in_context_rate,
+            state=state.clone(),
+            return_state=True,
+            raw_decay=raw_decay,
+        )
+
+        self.assertTrue(torch.allclose(actual.float(), expected.float(), atol=1e-2, rtol=1e-2))
+        self.assertTrue(torch.allclose(actual_state, expected_state, atol=1e-2, rtol=1e-2))
+        self.assertTrue(torch.allclose(actual.float(), fast_expected.float(), atol=1e-2, rtol=1e-2))
+        self.assertTrue(torch.allclose(actual_state, fast_expected_state, atol=1e-2, rtol=1e-2))
+
+    @unittest.skipIf(not torch.cuda.is_available() or find_spec("rwkv7") is None, "RWKV7 CUDA kernel is unavailable")
+    def test_linear_attention_sequence_kernel_path_matches_rwkv_lm_fast_reference(self):
+        batch_size = 2
+        seq_length = 32
+        num_heads = 2
+        head_size = 64
+        generator = torch.Generator(device="cuda").manual_seed(1)
+        raw_decay = torch.randn(
+            batch_size, seq_length, num_heads, head_size, generator=generator, device="cuda", dtype=torch.bfloat16
+        )
+        fast_log_decay = (-torch.nn.functional.softplus(-raw_decay.float()) - 0.5).to(raw_decay.dtype)
+        fast_decay = torch.exp(-torch.exp(fast_log_decay.float()))
+        receptance = (
+            torch.randn(
+                batch_size, seq_length, num_heads, head_size, generator=generator, device="cuda", dtype=torch.bfloat16
+            )
+            * 0.05
+        )
+        key = (
+            torch.randn(
+                batch_size, seq_length, num_heads, head_size, generator=generator, device="cuda", dtype=torch.bfloat16
+            )
+            * 0.05
+        )
+        value = (
+            torch.randn(
+                batch_size, seq_length, num_heads, head_size, generator=generator, device="cuda", dtype=torch.bfloat16
+            )
+            * 0.05
+        )
+        in_context_state = (
+            torch.randn(
+                batch_size, seq_length, num_heads, head_size, generator=generator, device="cuda", dtype=torch.bfloat16
+            )
+            * 0.05
+        )
+        in_context_rate = (
+            torch.randn(
+                batch_size, seq_length, num_heads, head_size, generator=generator, device="cuda", dtype=torch.bfloat16
+            )
+            * 0.05
+        )
+
+        expected, _ = self.reference_rwkv7_linear_attention(
+            fast_decay, receptance, key, value, in_context_state, in_context_rate
+        )
+        actual, actual_state = rwkv7_linear_attention(
+            fast_decay,
+            receptance,
+            key,
+            value,
+            in_context_state,
+            in_context_rate,
+            raw_decay=raw_decay,
+        )
+
+        self.assertIsNone(actual_state)
+        self.assertTrue(torch.allclose(actual.float(), expected.float(), atol=1e-2, rtol=1e-2))
 
     def test_converted_module_and_logits_match_reference(self):
         state_dict = self.get_random_rwkv7_state_dict()
